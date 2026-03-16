@@ -1,0 +1,14 @@
+services:
+  telecode:
+    build:
+      context: .
+    container_name: telecode
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ./config/.telecode
+    volumes:
+      - ./config/projects.json:/config/projects.json:ro
+      - ./data:/data
+      - /srv/repos:/workspaces
+      - /root/.codex:/root/.codex

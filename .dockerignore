@@ -1,0 +1,9 @@
+.git
+.github
+.pytest_cache
+.tmp
+.venv
+__pycache__
+*.pyc
+config/.telecode
+data

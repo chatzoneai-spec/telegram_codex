@@ -1,0 +1,26 @@
+{
+  "default_project": "gold-chain",
+  "projects": [
+    {
+      "name": "gold-chain",
+      "path": "/workspaces/gold-chain",
+      "repo": "https://github.com/chatzoneai-spec/Gold-Chain.git",
+      "branch": "master",
+      "deploy": ""
+    },
+    {
+      "name": "project-2",
+      "path": "/workspaces/project-2",
+      "repo": "https://github.com/your-org/project-2.git",
+      "branch": "main",
+      "deploy": ""
+    },
+    {
+      "name": "project-3",
+      "path": "/workspaces/project-3",
+      "repo": "https://github.com/your-org/project-3.git",
+      "branch": "main",
+      "deploy": ""
+    }
+  ]
+}
