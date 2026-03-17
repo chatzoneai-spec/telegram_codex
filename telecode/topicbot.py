@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Optional
 
 from telecode.claude import ask_claude_code
 from telecode.codex import ask_codex_exec
@@ -26,6 +26,7 @@ from telecode.telegram import (
     telegram_answer_callback_query,
     telegram_delete_forum_topic,
     telegram_delete_webhook,
+    telegram_download_file,
     telegram_edit_message_text,
     telegram_get_my_commands,
     telegram_get_updates,
@@ -248,10 +249,23 @@ def _handle_message(
         return
 
     text = (msg.get("text") or "").strip()
-    if not text:
+    image_paths: list[str] = []
+    has_image = "photo" in msg or _is_image_document(msg.get("document"))
+    prompt = text
+
+    if has_image:
+        try:
+            prompt, image_paths = _extract_image_prompt_and_paths(msg, telegram)
+        except ValueError as exc:
+            _send_scope_message(telegram, chat_id, thread_id, message_id, f"Error: {exc}")
+            return
+        except Exception as exc:
+            _send_scope_message(telegram, chat_id, thread_id, message_id, f"Error: {exc}")
+            return
+    elif not text:
         return
 
-    if _handle_command(
+    if not has_image and _handle_command(
         text,
         chat_id,
         thread_id,
@@ -290,9 +304,10 @@ def _handle_message(
         thread_id=thread_id,
         message_id=message_id,
         title=title,
-        prompt=text,
+        prompt=prompt,
         project=project,
         scope_snapshot=scope,
+        image_paths=image_paths,
     )
 
 
@@ -573,6 +588,7 @@ def _start_prompt_task(
     prompt: str,
     project: ProjectConfig,
     scope_snapshot: dict[str, Any],
+    image_paths: list[str] | None = None,
 ) -> bool:
     if _get_active_task(chat_id, thread_id) is not None:
         _send_scope_message(
@@ -619,6 +635,7 @@ def _start_prompt_task(
                 project=project,
                 timeout_s=timeout_s,
                 default_engine=default_engine,
+                image_paths=image_paths,
                 process_callback=lambda process: _set_task_process(chat_id, thread_id, process),
                 event_callback=_progress_callback,
             )
@@ -676,6 +693,8 @@ def _start_prompt_task(
             except Exception:
                 pass
             _send_scope_message(telegram, chat_id, thread_id, message_id, f"Error: {exc}")
+        finally:
+            _cleanup_temp_paths(image_paths or [])
 
     if not _launch_topic_task(chat_id, thread_id, _runner):
         _send_scope_message(
@@ -739,6 +758,7 @@ def _run_prompt(
     project: ProjectConfig,
     timeout_s: int | None,
     default_engine: str,
+    image_paths: list[str] | None = None,
     process_callback=None,
     event_callback=None,
 ) -> str:
@@ -756,7 +776,7 @@ def _run_prompt(
                 _format_agent_prompt(project, prompt),
                 session_id=session_id,
                 timeout_s=timeout_s,
-                image_paths=[],
+                image_paths=image_paths or [],
             )
         sessions["claude"] = session_id
         return answer.strip()
@@ -765,7 +785,7 @@ def _run_prompt(
         _format_agent_prompt(project, prompt),
         session_id=session_id,
         timeout_s=timeout_s,
-        image_paths=[],
+        image_paths=image_paths or [],
         cwd=project.path,
         sandbox_mode="danger-full-access",
         approval_policy="dangerous",
@@ -873,6 +893,77 @@ def _topic_title(message: dict[str, Any]) -> str | None:
         name = created.get("name")
         return str(name).strip() if name else None
     return None
+
+
+def _extract_image_prompt_and_paths(
+    msg: dict[str, Any],
+    telegram: TelegramConfig,
+) -> tuple[str, list[str]]:
+    caption = msg.get("caption")
+    prompt = caption if isinstance(caption, str) else ""
+    if "photo" in msg:
+        photo_id = _pick_best_photo_id(msg.get("photo", []))
+        if not photo_id:
+            raise ValueError("No photo data found.")
+        image_bytes, file_path = telegram_download_file(telegram, photo_id)
+        return prompt, [_write_temp_image(image_bytes, file_path)]
+
+    document = msg.get("document") or {}
+    file_id = document.get("file_id")
+    if not file_id:
+        raise ValueError("No document data found.")
+    image_bytes, file_path = telegram_download_file(telegram, file_id)
+    return prompt, [_write_temp_image(image_bytes, file_path)]
+
+
+def _is_image_document(document: Optional[dict]) -> bool:
+    if not isinstance(document, dict):
+        return False
+    mime = (document.get("mime_type") or "").lower()
+    return mime.startswith("image/")
+
+
+def _pick_best_photo_id(photos: list[dict]) -> Optional[str]:
+    if not photos:
+        return None
+
+    def score(photo: dict) -> int:
+        file_size = photo.get("file_size") or 0
+        width = photo.get("width") or 0
+        height = photo.get("height") or 0
+        return file_size or (width * height)
+
+    best = max(photos, key=score)
+    return best.get("file_id")
+
+
+def _write_temp_image(image_bytes: bytes, file_path: str) -> str:
+    _, ext = os.path.splitext(file_path)
+    suffix = ext if ext else ".jpg"
+    temp_dir = _ensure_temp_dir()
+    filename = f"image_{uuid.uuid4().hex}{suffix}"
+    path = os.path.join(temp_dir, filename)
+    with open(path, "wb") as handle:
+        handle.write(image_bytes)
+    return path
+
+
+def _ensure_temp_dir() -> str:
+    path = os.path.join(os.getcwd(), ".telecode_tmp")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _cleanup_temp_paths(paths: list[str]) -> None:
+    for path in paths:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _welcome_message(scope: dict[str, Any], registry: ProjectRegistry) -> str:

@@ -1,0 +1,25 @@
+{
+  "projects": [
+    {
+      "name": "gold-chain",
+      "path": "/srv/repos/gold-chain",
+      "repo": "git@github.com:chatzoneai-spec/Gold-Chain.git",
+      "branch": "master",
+      "deploy": ""
+    },
+    {
+      "name": "chatzone",
+      "path": "/srv/repos/chatzone",
+      "repo": "",
+      "branch": "",
+      "deploy": ""
+    },
+    {
+      "name": "fam",
+      "path": "/srv/repos/fam",
+      "repo": "git@github.com:chatzoneai-spec/Drippy.git",
+      "branch": "main",
+      "deploy": ""
+    }
+  ]
+}
