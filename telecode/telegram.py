@@ -131,7 +131,10 @@ def telegram_get_updates(
         payload["offset"] = offset
     if allowed_updates is not None:
         payload["allowed_updates"] = allowed_updates
-    data = _post_json(f"{config.api_base}/getUpdates", payload, timeout_s=timeout + 10)
+    try:
+        data = _post_json(f"{config.api_base}/getUpdates", payload, timeout_s=timeout + 10)
+    except httpx.TimeoutException:
+        return []
     result = data.get("result", [])
     return result if isinstance(result, list) else []
 

@@ -156,12 +156,17 @@ def run_polling(
     while True:
         state = load_state(state_file)
         offset = get_update_offset(state)
-        updates = telegram_get_updates(
-            telegram,
-            offset=offset,
-            timeout=poll_timeout_s,
-            allowed_updates=["message", "callback_query"],
-        )
+        try:
+            updates = telegram_get_updates(
+                telegram,
+                offset=offset,
+                timeout=poll_timeout_s,
+                allowed_updates=["message", "callback_query"],
+            )
+        except Exception as exc:
+            print(f"Warning: Telegram polling failed: {exc}")
+            time.sleep(2)
+            continue
         if not updates:
             continue
 
@@ -600,32 +605,96 @@ def _start_prompt_task(
         )
         return False
 
-    progress_lines = ["Started."]
+    progress_state: dict[str, Any] = {
+        "status_lines": ["Started."],
+        "pending_lines": [],
+        "last_status_flush_at": 0.0,
+        "last_log_flush_at": 0.0,
+    }
+    progress_lock = threading.RLock()
     progress_message_id = _send_scope_message(
         telegram,
         chat_id,
         thread_id,
         message_id,
-        _render_progress_text(progress_lines),
+        _render_progress_text(progress_state["status_lines"]),
     )
 
-    def _progress_callback(event: dict[str, Any]) -> None:
-        line = _format_progress_event(event)
-        if not line:
-            return
-        if progress_lines and progress_lines[-1] == line:
-            return
-        progress_lines.append(line)
-        del progress_lines[:-8]
+    def _append_progress_line(line: str) -> bool:
+        with progress_lock:
+            status_lines = progress_state["status_lines"]
+            pending_lines = progress_state["pending_lines"]
+            if status_lines and status_lines[-1] == line:
+                return False
+            status_lines.append(line)
+            del status_lines[:-8]
+            pending_lines.append(line)
+            return True
+
+    def _flush_progress_status(extra_line: str | None = None, force: bool = False) -> None:
+        nonlocal progress_message_id
+        with progress_lock:
+            lines = list(progress_state["status_lines"])
+            if extra_line:
+                lines.append(extra_line)
+            if not force:
+                now = time.monotonic()
+                if now - float(progress_state["last_status_flush_at"]) < 1.0:
+                    return
+                progress_state["last_status_flush_at"] = now
+            text = _render_progress_text(lines)
         try:
             telegram_edit_message_text(
                 telegram,
                 chat_id,
                 progress_message_id,
-                _render_progress_text(progress_lines),
+                text,
             )
         except Exception:
-            pass
+            try:
+                progress_message_id = _send_scope_message(
+                    telegram,
+                    chat_id,
+                    thread_id,
+                    message_id,
+                    text,
+                )
+            except Exception:
+                pass
+
+    def _flush_progress_log(force: bool = False) -> None:
+        with progress_lock:
+            pending_lines = progress_state["pending_lines"]
+            if not pending_lines:
+                return
+            if not force:
+                now = time.monotonic()
+                if len(pending_lines) < 4 and now - float(progress_state["last_log_flush_at"]) < 2.5:
+                    return
+                progress_state["last_log_flush_at"] = now
+            lines = list(pending_lines[:10])
+            del pending_lines[: len(lines)]
+        try:
+            _send_scope_message(
+                telegram,
+                chat_id,
+                thread_id,
+                message_id,
+                _render_progress_log_text(lines),
+            )
+        except Exception:
+            with progress_lock:
+                progress_state["pending_lines"] = lines + progress_state["pending_lines"]
+
+    def _progress_callback(event: dict[str, Any]) -> None:
+        line = _format_progress_event(event)
+        if not line:
+            return
+        if not _append_progress_line(line):
+            return
+        _flush_progress_status()
+        if _should_emit_progress_log(event):
+            _flush_progress_log()
 
     def _runner(task: dict[str, Any]) -> None:
         try:
@@ -640,15 +709,8 @@ def _start_prompt_task(
                 event_callback=_progress_callback,
             )
             if task.get("cancel_requested"):
-                try:
-                    telegram_edit_message_text(
-                        telegram,
-                        chat_id,
-                        progress_message_id,
-                        _render_progress_text(progress_lines + ["Stopped."]),
-                    )
-                except Exception:
-                    pass
+                _flush_progress_log(force=True)
+                _flush_progress_status(extra_line="Stopped.", force=True)
                 return
             state = load_state(state_file)
             updated_scope = ensure_scope(state, chat_id, thread_id, title=title)
@@ -661,37 +723,17 @@ def _start_prompt_task(
                 }
             )
             save_state(state_file, state)
-            try:
-                telegram_edit_message_text(
-                    telegram,
-                    chat_id,
-                    progress_message_id,
-                    _render_progress_text(progress_lines + ["Done."]),
-                )
-            except Exception:
-                pass
+            _flush_progress_log(force=True)
+            _flush_progress_status(extra_line="Done.", force=True)
             _send_scope_message(telegram, chat_id, thread_id, message_id, answer)
         except Exception as exc:
             if task.get("cancel_requested"):
-                try:
-                    telegram_edit_message_text(
-                        telegram,
-                        chat_id,
-                        progress_message_id,
-                        _render_progress_text(progress_lines + ["Stopped."]),
-                    )
-                except Exception:
-                    pass
+                _flush_progress_log(force=True)
+                _flush_progress_status(extra_line="Stopped.", force=True)
                 return
-            try:
-                telegram_edit_message_text(
-                    telegram,
-                    chat_id,
-                    progress_message_id,
-                    _render_progress_text(progress_lines + [f"Error: {_truncate_inline(str(exc), 120)}"]),
-                )
-            except Exception:
-                pass
+            _append_progress_line(f"Error: {_truncate_inline(str(exc), 120)}")
+            _flush_progress_log(force=True)
+            _flush_progress_status(force=True)
             _send_scope_message(telegram, chat_id, thread_id, message_id, f"Error: {exc}")
         finally:
             _cleanup_temp_paths(image_paths or [])
@@ -1066,6 +1108,24 @@ def _truncate_inline(text: str, limit: int = 160) -> str:
 def _render_progress_text(lines: list[str]) -> str:
     body = "\n".join(f"- {line}" for line in lines[-8:])
     return f"Progress\n{body}"
+
+
+def _render_progress_log_text(lines: list[str]) -> str:
+    body = "\n".join(f"- {line}" for line in lines)
+    return f"Progress Log\n{body}"
+
+
+def _should_emit_progress_log(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type") or "")
+    if item_type == "agent_message":
+        return event_type == "item.completed"
+    if item_type == "command_execution":
+        return event_type == "item.completed"
+    return False
 
 
 def _format_progress_event(event: dict[str, Any]) -> str | None:

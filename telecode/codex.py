@@ -292,6 +292,9 @@ def _extract_last_message(output: str) -> str:
 
 def _extract_last_agent_message(output: str) -> str:
     last = ""
+    current_turn_messages: list[str] = []
+    last_turn_messages: list[str] = []
+    saw_turn = False
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -302,7 +305,16 @@ def _extract_last_agent_message(output: str) -> str:
             continue
         if not isinstance(data, dict):
             continue
-        if data.get("type") != "item.completed":
+        event_type = data.get("type")
+        if event_type == "turn.started":
+            saw_turn = True
+            current_turn_messages = []
+            continue
+        if event_type == "turn.completed":
+            if current_turn_messages:
+                last_turn_messages = list(current_turn_messages)
+            continue
+        if event_type != "item.completed":
             continue
         item = data.get("item")
         if not isinstance(item, dict):
@@ -312,4 +324,10 @@ def _extract_last_agent_message(output: str) -> str:
         text = item.get("text")
         if isinstance(text, str) and text.strip():
             last = text.strip()
+            if saw_turn:
+                current_turn_messages.append(last)
+    if last_turn_messages:
+        return last_turn_messages[-1]
+    if current_turn_messages:
+        return current_turn_messages[-1]
     return last
