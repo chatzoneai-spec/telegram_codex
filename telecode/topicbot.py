@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager
 from typing import Any, Optional
 
@@ -27,7 +28,6 @@ from telecode.telegram import (
     telegram_delete_forum_topic,
     telegram_delete_webhook,
     telegram_download_file,
-    telegram_edit_message_text,
     telegram_get_my_commands,
     telegram_get_updates,
     telegram_send_message,
@@ -51,6 +51,12 @@ _BOT_COMMANDS = [
 _STATE_LOCK = threading.RLock()
 _TASKS_LOCK = threading.RLock()
 _ACTIVE_TASKS: dict[str, dict[str, Any]] = {}
+_TASK_HISTORY_LIMIT = 20
+_TASK_LOG_BATCH_SIZE = 8
+_TASK_DELIVERY_POLL_S = 1.0
+_TASK_HEARTBEAT_INTERVAL_S = 30.0
+_TASK_HEARTBEAT_POLL_S = 5.0
+_TERMINAL_TASK_STATUSES = {"done", "failed", "stopped"}
 
 
 def load_state(path: str) -> dict[str, Any]:
@@ -61,6 +67,20 @@ def load_state(path: str) -> dict[str, Any]:
 def save_state(path: str, state: dict[str, Any]) -> None:
     with _STATE_LOCK:
         _state_save(path, state)
+
+
+def _mutate_state(path: str, mutator) -> Any:
+    with _STATE_LOCK:
+        state = _state_load(path)
+        result = mutator(state)
+        _state_save(path, state)
+        return result
+
+
+def _read_state(path: str, reader) -> Any:
+    with _STATE_LOCK:
+        state = _state_load(path)
+        return reader(state)
 
 
 def _scope_id(chat_id: int, thread_id: int | None) -> str:
@@ -139,6 +159,344 @@ def _launch_topic_task(
         _ACTIVE_TASKS[key] = task
         thread.start()
     return True
+
+
+def _ensure_task_journal(scope: dict[str, Any]) -> dict[str, Any]:
+    journal = scope.get("task_journal")
+    if not isinstance(journal, dict):
+        journal = {"active_task_id": "", "tasks": []}
+        scope["task_journal"] = journal
+    active_task_id = journal.get("active_task_id")
+    if not isinstance(active_task_id, str):
+        journal["active_task_id"] = ""
+    tasks = journal.get("tasks")
+    if not isinstance(tasks, list):
+        journal["tasks"] = []
+    return journal
+
+
+def _prune_task_history(journal: dict[str, Any]) -> None:
+    tasks = journal.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) <= _TASK_HISTORY_LIMIT:
+        return
+    active_task_id = str(journal.get("active_task_id") or "")
+    kept: list[dict[str, Any]] = []
+    to_drop = len(tasks) - _TASK_HISTORY_LIMIT
+    for task in tasks:
+        task_id = str(task.get("id") or "")
+        if to_drop > 0 and task_id != active_task_id:
+            to_drop -= 1
+            continue
+        kept.append(task)
+    if len(kept) > _TASK_HISTORY_LIMIT:
+        kept = kept[-_TASK_HISTORY_LIMIT:]
+    journal["tasks"] = kept
+
+
+def _find_task_record(journal: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+    tasks = journal.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if isinstance(task, dict) and str(task.get("id") or "") == task_id:
+            return task
+    return None
+
+
+def _create_task_record(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    *,
+    task_id: str,
+    kind: str,
+    project: str,
+    engine: str,
+    title: str | None,
+    detail: str,
+) -> None:
+    now = time.time()
+
+    def mutator(state: dict[str, Any]) -> None:
+        scope = ensure_scope(state, chat_id, thread_id, title=title)
+        journal = _ensure_task_journal(scope)
+        task = {
+            "id": task_id,
+            "kind": kind,
+            "status": "running",
+            "project": project,
+            "engine": engine,
+            "title": title or "",
+            "detail": detail,
+            "created_at": now,
+            "updated_at": now,
+            "last_activity_at": now,
+            "last_heartbeat_at": 0.0,
+            "last_line": "Started.",
+            "log_lines": ["Started."],
+            "next_unsent_index": 0,
+            "final_message_text": "",
+            "final_message_sent": False,
+        }
+        journal["tasks"].append(task)
+        journal["active_task_id"] = task_id
+        _prune_task_history(journal)
+
+    _mutate_state(state_file, mutator)
+
+
+def _discard_task_record(state_file: str, chat_id: int, thread_id: int | None, task_id: str) -> None:
+    def mutator(state: dict[str, Any]) -> None:
+        scope = ensure_scope(state, chat_id, thread_id)
+        journal = _ensure_task_journal(scope)
+        tasks = journal.get("tasks")
+        if isinstance(tasks, list):
+            journal["tasks"] = [
+                task
+                for task in tasks
+                if not (isinstance(task, dict) and str(task.get("id") or "") == task_id)
+            ]
+        if str(journal.get("active_task_id") or "") == task_id:
+            journal["active_task_id"] = ""
+
+    _mutate_state(state_file, mutator)
+
+
+def _append_task_log_line(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+    line: str,
+    *,
+    heartbeat: bool = False,
+) -> bool:
+    now = time.time()
+
+    def mutator(state: dict[str, Any]) -> bool:
+        scope = ensure_scope(state, chat_id, thread_id)
+        task = _find_task_record(_ensure_task_journal(scope), task_id)
+        if task is None:
+            return False
+        log_lines = task.setdefault("log_lines", [])
+        if log_lines and log_lines[-1] == line:
+            return False
+        log_lines.append(line)
+        task["updated_at"] = now
+        task["last_line"] = line
+        if heartbeat:
+            task["last_heartbeat_at"] = now
+        else:
+            task["last_activity_at"] = now
+        return True
+
+    return bool(_mutate_state(state_file, mutator))
+
+
+def _get_task_snapshot(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+) -> dict[str, Any] | None:
+    def reader(state: dict[str, Any]) -> dict[str, Any] | None:
+        scope = ensure_scope(state, chat_id, thread_id)
+        task = _find_task_record(_ensure_task_journal(scope), task_id)
+        if task is None:
+            return None
+        return deepcopy(task)
+
+    return _read_state(state_file, reader)
+
+
+def _peek_task_log_batch(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+    batch_size: int = _TASK_LOG_BATCH_SIZE,
+) -> list[str]:
+    def reader(state: dict[str, Any]) -> list[str]:
+        scope = ensure_scope(state, chat_id, thread_id)
+        task = _find_task_record(_ensure_task_journal(scope), task_id)
+        if task is None:
+            return []
+        log_lines = task.get("log_lines")
+        if not isinstance(log_lines, list):
+            return []
+        next_unsent_index = int(task.get("next_unsent_index") or 0)
+        return list(log_lines[next_unsent_index : next_unsent_index + batch_size])
+
+    return _read_state(state_file, reader)
+
+
+def _ack_task_log_batch(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+    count: int,
+) -> None:
+    def mutator(state: dict[str, Any]) -> None:
+        scope = ensure_scope(state, chat_id, thread_id)
+        task = _find_task_record(_ensure_task_journal(scope), task_id)
+        if task is None:
+            return
+        log_lines = task.get("log_lines")
+        if not isinstance(log_lines, list):
+            return
+        next_unsent_index = int(task.get("next_unsent_index") or 0)
+        task["next_unsent_index"] = min(len(log_lines), next_unsent_index + max(0, count))
+        task["updated_at"] = time.time()
+
+    _mutate_state(state_file, mutator)
+
+
+def _mark_task_terminal(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+    *,
+    status: str,
+    final_message_text: str = "",
+) -> None:
+    now = time.time()
+
+    def mutator(state: dict[str, Any]) -> None:
+        scope = ensure_scope(state, chat_id, thread_id)
+        journal = _ensure_task_journal(scope)
+        task = _find_task_record(journal, task_id)
+        if task is None:
+            return
+        task["status"] = status
+        task["updated_at"] = now
+        if final_message_text:
+            task["final_message_text"] = final_message_text
+            task["final_message_sent"] = False
+        if str(journal.get("active_task_id") or "") == task_id:
+            journal["active_task_id"] = ""
+
+    _mutate_state(state_file, mutator)
+
+
+def _mark_task_final_message_sent(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+) -> None:
+    def mutator(state: dict[str, Any]) -> None:
+        scope = ensure_scope(state, chat_id, thread_id)
+        task = _find_task_record(_ensure_task_journal(scope), task_id)
+        if task is None:
+            return
+        task["final_message_sent"] = True
+        task["updated_at"] = time.time()
+
+    _mutate_state(state_file, mutator)
+
+
+def _start_task_delivery_loop(
+    telegram: TelegramConfig,
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    message_id: int,
+    task_id: str,
+) -> None:
+    def _delivery() -> None:
+        while True:
+            batch = _peek_task_log_batch(state_file, chat_id, thread_id, task_id)
+            if batch:
+                try:
+                    _send_scope_message(
+                        telegram,
+                        chat_id,
+                        thread_id,
+                        message_id,
+                        _render_progress_log_text(batch),
+                    )
+                except Exception as exc:
+                    time.sleep(_delivery_retry_delay(exc))
+                    continue
+                _ack_task_log_batch(state_file, chat_id, thread_id, task_id, len(batch))
+                time.sleep(_TASK_DELIVERY_POLL_S)
+                continue
+
+            snapshot = _get_task_snapshot(state_file, chat_id, thread_id, task_id)
+            if snapshot is None:
+                return
+
+            final_message_text = str(snapshot.get("final_message_text") or "")
+            if snapshot.get("status") in _TERMINAL_TASK_STATUSES and final_message_text and not snapshot.get("final_message_sent"):
+                try:
+                    _send_scope_message(telegram, chat_id, thread_id, message_id, final_message_text)
+                except Exception as exc:
+                    time.sleep(_delivery_retry_delay(exc))
+                    continue
+                _mark_task_final_message_sent(state_file, chat_id, thread_id, task_id)
+                time.sleep(_TASK_DELIVERY_POLL_S)
+                continue
+
+            log_lines = snapshot.get("log_lines")
+            if not isinstance(log_lines, list):
+                log_lines = []
+            next_unsent_index = int(snapshot.get("next_unsent_index") or 0)
+            final_sent = bool(snapshot.get("final_message_sent"))
+            if (
+                snapshot.get("status") in _TERMINAL_TASK_STATUSES
+                and next_unsent_index >= len(log_lines)
+                and (final_sent or not final_message_text)
+            ):
+                return
+            time.sleep(_TASK_DELIVERY_POLL_S)
+
+    thread = threading.Thread(
+        target=_delivery,
+        name=f"telecode-delivery-{chat_id}-{thread_id or 0}-{task_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _start_task_heartbeat_loop(
+    state_file: str,
+    chat_id: int,
+    thread_id: int | None,
+    task_id: str,
+) -> None:
+    def _heartbeat() -> None:
+        while True:
+            snapshot = _get_task_snapshot(state_file, chat_id, thread_id, task_id)
+            if snapshot is None:
+                return
+            if snapshot.get("status") != "running":
+                return
+            now = time.time()
+            last_activity_at = float(snapshot.get("last_activity_at") or snapshot.get("created_at") or now)
+            last_heartbeat_at = float(snapshot.get("last_heartbeat_at") or 0.0)
+            if (
+                now - last_activity_at >= _TASK_HEARTBEAT_INTERVAL_S
+                and now - last_heartbeat_at >= _TASK_HEARTBEAT_INTERVAL_S
+            ):
+                last_line = str(snapshot.get("last_line") or "Working.")
+                _append_task_log_line(
+                    state_file,
+                    chat_id,
+                    thread_id,
+                    task_id,
+                    f"Still working. Last step: {_truncate_inline(last_line, 120)}",
+                    heartbeat=True,
+                )
+            time.sleep(_TASK_HEARTBEAT_POLL_S)
+
+    thread = threading.Thread(
+        target=_heartbeat,
+        name=f"telecode-heartbeat-{chat_id}-{thread_id or 0}-{task_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
 
 
 def run_polling(
@@ -523,6 +881,7 @@ def _handle_command(
             return True
         _start_cli_task(
             telegram=telegram,
+            state_file=state_file,
             chat_id=chat_id,
             thread_id=thread_id,
             message_id=message_id,
@@ -542,6 +901,7 @@ def _handle_command(
             return True
         _start_cli_task(
             telegram=telegram,
+            state_file=state_file,
             chat_id=chat_id,
             thread_id=thread_id,
             message_id=message_id,
@@ -605,96 +965,24 @@ def _start_prompt_task(
         )
         return False
 
-    progress_state: dict[str, Any] = {
-        "status_lines": ["Started."],
-        "pending_lines": [],
-        "last_status_flush_at": 0.0,
-        "last_log_flush_at": 0.0,
-    }
-    progress_lock = threading.RLock()
-    progress_message_id = _send_scope_message(
-        telegram,
+    task_id = uuid.uuid4().hex
+    _create_task_record(
+        state_file,
         chat_id,
         thread_id,
-        message_id,
-        _render_progress_text(progress_state["status_lines"]),
+        task_id=task_id,
+        kind="prompt",
+        project=project.name,
+        engine=scope_snapshot.get("engine", default_engine),
+        title=title,
+        detail=_truncate_inline(prompt, 160),
     )
-
-    def _append_progress_line(line: str) -> bool:
-        with progress_lock:
-            status_lines = progress_state["status_lines"]
-            pending_lines = progress_state["pending_lines"]
-            if status_lines and status_lines[-1] == line:
-                return False
-            status_lines.append(line)
-            del status_lines[:-8]
-            pending_lines.append(line)
-            return True
-
-    def _flush_progress_status(extra_line: str | None = None, force: bool = False) -> None:
-        nonlocal progress_message_id
-        with progress_lock:
-            lines = list(progress_state["status_lines"])
-            if extra_line:
-                lines.append(extra_line)
-            if not force:
-                now = time.monotonic()
-                if now - float(progress_state["last_status_flush_at"]) < 1.0:
-                    return
-                progress_state["last_status_flush_at"] = now
-            text = _render_progress_text(lines)
-        try:
-            telegram_edit_message_text(
-                telegram,
-                chat_id,
-                progress_message_id,
-                text,
-            )
-        except Exception:
-            try:
-                progress_message_id = _send_scope_message(
-                    telegram,
-                    chat_id,
-                    thread_id,
-                    message_id,
-                    text,
-                )
-            except Exception:
-                pass
-
-    def _flush_progress_log(force: bool = False) -> None:
-        with progress_lock:
-            pending_lines = progress_state["pending_lines"]
-            if not pending_lines:
-                return
-            if not force:
-                now = time.monotonic()
-                if len(pending_lines) < 4 and now - float(progress_state["last_log_flush_at"]) < 2.5:
-                    return
-                progress_state["last_log_flush_at"] = now
-            lines = list(pending_lines[:10])
-            del pending_lines[: len(lines)]
-        try:
-            _send_scope_message(
-                telegram,
-                chat_id,
-                thread_id,
-                message_id,
-                _render_progress_log_text(lines),
-            )
-        except Exception:
-            with progress_lock:
-                progress_state["pending_lines"] = lines + progress_state["pending_lines"]
 
     def _progress_callback(event: dict[str, Any]) -> None:
         line = _format_progress_event(event)
         if not line:
             return
-        if not _append_progress_line(line):
-            return
-        _flush_progress_status()
-        if _should_emit_progress_log(event):
-            _flush_progress_log()
+        _append_task_log_line(state_file, chat_id, thread_id, task_id, line)
 
     def _runner(task: dict[str, Any]) -> None:
         try:
@@ -709,8 +997,8 @@ def _start_prompt_task(
                 event_callback=_progress_callback,
             )
             if task.get("cancel_requested"):
-                _flush_progress_log(force=True)
-                _flush_progress_status(extra_line="Stopped.", force=True)
+                _append_task_log_line(state_file, chat_id, thread_id, task_id, "Stopped.")
+                _mark_task_terminal(state_file, chat_id, thread_id, task_id, status="stopped")
                 return
             state = load_state(state_file)
             updated_scope = ensure_scope(state, chat_id, thread_id, title=title)
@@ -723,22 +1011,35 @@ def _start_prompt_task(
                 }
             )
             save_state(state_file, state)
-            _flush_progress_log(force=True)
-            _flush_progress_status(extra_line="Done.", force=True)
-            _send_scope_message(telegram, chat_id, thread_id, message_id, answer)
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, "Completed.")
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, "Final answer follows below.")
+            _mark_task_terminal(
+                state_file,
+                chat_id,
+                thread_id,
+                task_id,
+                status="done",
+                final_message_text=answer,
+            )
         except Exception as exc:
             if task.get("cancel_requested"):
-                _flush_progress_log(force=True)
-                _flush_progress_status(extra_line="Stopped.", force=True)
+                _append_task_log_line(state_file, chat_id, thread_id, task_id, "Stopped.")
+                _mark_task_terminal(state_file, chat_id, thread_id, task_id, status="stopped")
                 return
-            _append_progress_line(f"Error: {_truncate_inline(str(exc), 120)}")
-            _flush_progress_log(force=True)
-            _flush_progress_status(force=True)
-            _send_scope_message(telegram, chat_id, thread_id, message_id, f"Error: {exc}")
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, f"Failed: {_truncate_inline(str(exc), 120)}")
+            _mark_task_terminal(
+                state_file,
+                chat_id,
+                thread_id,
+                task_id,
+                status="failed",
+                final_message_text=f"Error: {exc}",
+            )
         finally:
             _cleanup_temp_paths(image_paths or [])
 
     if not _launch_topic_task(chat_id, thread_id, _runner):
+        _discard_task_record(state_file, chat_id, thread_id, task_id)
         _send_scope_message(
             telegram,
             chat_id,
@@ -747,11 +1048,14 @@ def _start_prompt_task(
             "This topic already has a running task. Use /stop or wait.",
         )
         return False
+    _start_task_delivery_loop(telegram, state_file, chat_id, thread_id, message_id, task_id)
+    _start_task_heartbeat_loop(state_file, chat_id, thread_id, task_id)
     return True
 
 
 def _start_cli_task(
     telegram: TelegramConfig,
+    state_file: str,
     chat_id: int,
     thread_id: int | None,
     message_id: int,
@@ -769,18 +1073,55 @@ def _start_cli_task(
         )
         return False
 
+    task_id = uuid.uuid4().hex
+    _create_task_record(
+        state_file=state_file,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        task_id=task_id,
+        kind="cli",
+        project=cwd,
+        engine="cli",
+        title=None,
+        detail=_truncate_inline(command, 160),
+    )
+
     def _runner(task: dict[str, Any]) -> None:
-        output = _run_cli_command(
-            command,
-            cwd,
-            timeout_s=timeout_s,
-            process_callback=lambda process: _set_task_process(chat_id, thread_id, process),
-        )
-        if task.get("cancel_requested"):
-            return
-        _send_scope_message(telegram, chat_id, thread_id, message_id, output)
+        try:
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, f"Running: {_normalize_command(command)}")
+            output = _run_cli_command(
+                command,
+                cwd,
+                timeout_s=timeout_s,
+                process_callback=lambda process: _set_task_process(chat_id, thread_id, process),
+            )
+            if task.get("cancel_requested"):
+                _append_task_log_line(state_file, chat_id, thread_id, task_id, "Stopped.")
+                _mark_task_terminal(state_file, chat_id, thread_id, task_id, status="stopped")
+                return
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, "Completed.")
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, "Command output follows below.")
+            _mark_task_terminal(
+                state_file,
+                chat_id,
+                thread_id,
+                task_id,
+                status="done",
+                final_message_text=output,
+            )
+        except Exception as exc:
+            _append_task_log_line(state_file, chat_id, thread_id, task_id, f"Failed: {_truncate_inline(str(exc), 120)}")
+            _mark_task_terminal(
+                state_file,
+                chat_id,
+                thread_id,
+                task_id,
+                status="failed",
+                final_message_text=f"Error: {exc}",
+            )
 
     if not _launch_topic_task(chat_id, thread_id, _runner):
+        _discard_task_record(state_file, chat_id, thread_id, task_id)
         _send_scope_message(
             telegram,
             chat_id,
@@ -790,7 +1131,8 @@ def _start_cli_task(
         )
         return False
 
-    _send_scope_message(telegram, chat_id, thread_id, message_id, "Working...")
+    _start_task_delivery_loop(telegram, state_file, chat_id, thread_id, message_id, task_id)
+    _start_task_heartbeat_loop(state_file, chat_id, thread_id, task_id)
     return True
 
 
@@ -1115,17 +1457,23 @@ def _render_progress_log_text(lines: list[str]) -> str:
     return f"Progress Log\n{body}"
 
 
-def _should_emit_progress_log(event: dict[str, Any]) -> bool:
-    event_type = str(event.get("type") or "")
-    item = event.get("item")
-    if not isinstance(item, dict):
-        return False
-    item_type = str(item.get("type") or "")
-    if item_type == "agent_message":
-        return event_type == "item.completed"
-    if item_type == "command_execution":
-        return event_type == "item.completed"
-    return False
+def _delivery_retry_delay(exc: Exception) -> float:
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 429:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            parameters = payload.get("parameters")
+            if isinstance(parameters, dict):
+                retry_after = parameters.get("retry_after")
+                try:
+                    if retry_after is not None:
+                        return max(float(retry_after), _TASK_DELIVERY_POLL_S)
+                except (TypeError, ValueError):
+                    pass
+    return _TASK_DELIVERY_POLL_S
 
 
 def _format_progress_event(event: dict[str, Any]) -> str | None:

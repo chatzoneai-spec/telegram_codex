@@ -73,6 +73,16 @@ def ensure_scope(
     scope.setdefault("status", "active")
     scope.setdefault("engine", "")
     scope.setdefault("project", "")
+    journal = scope.get("task_journal")
+    if not isinstance(journal, dict):
+        scope["task_journal"] = {"active_task_id": "", "tasks": []}
+    else:
+        active_task_id = journal.get("active_task_id")
+        if not isinstance(active_task_id, str):
+            journal["active_task_id"] = ""
+        tasks = journal.get("tasks")
+        if not isinstance(tasks, list):
+            journal["tasks"] = []
     sessions = scope.get("sessions")
     if not isinstance(sessions, dict):
         scope["sessions"] = {"claude": None, "codex": None}

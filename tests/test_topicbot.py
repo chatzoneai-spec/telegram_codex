@@ -9,6 +9,19 @@ def _dummy_telegram():
     return topicbot.TelegramConfig(bot_token="test-token")
 
 
+def _capture_text_message(sink, value=1):
+    def sender(*args, **kwargs):
+        payload = dict(kwargs)
+        if len(args) >= 2:
+            payload.setdefault("chat_id", args[1])
+        if len(args) >= 3:
+            payload.setdefault("text", args[2])
+        sink.append(payload)
+        return value
+
+    return sender
+
+
 def _write_projects(tmp_path, projects, default_project=None):
     path = tmp_path / ".telecode.projects.json"
     payload = {"projects": projects}
@@ -51,7 +64,7 @@ def test_plain_text_requires_project_selection_without_default(monkeypatch, tmp_
     monkeypatch.setattr(
         topicbot,
         "telegram_send_message",
-        lambda *args, **kwargs: sent.append(kwargs) or 1,
+        _capture_text_message(sent),
     )
 
     topicbot.process_update(
@@ -152,7 +165,7 @@ def test_default_project_runs_codex_in_selected_repo(monkeypatch, tmp_path):
         return ("done", "sess-123", "logs")
 
     monkeypatch.setattr(topicbot, "ask_codex_exec", fake_codex)
-    monkeypatch.setattr(topicbot, "telegram_send_message", lambda *args, **kwargs: sent.append(kwargs) or 1)
+    monkeypatch.setattr(topicbot, "telegram_send_message", _capture_text_message(sent))
 
     topicbot.process_update(
         {"update_id": 1, "message": _message(200, 22, "fix the bug")},
@@ -163,6 +176,10 @@ def test_default_project_runs_codex_in_selected_repo(monkeypatch, tmp_path):
         timeout_s=None,
     )
 
+    for _ in range(50):
+        if topicbot._get_active_task(200, 22) is None and sent:
+            break
+        time.sleep(0.02)
     state = topicbot.load_state(state_file)
     assert captured["cwd"] == str(project_a)
     assert captured["sandbox_mode"] == "danger-full-access"
@@ -370,7 +387,7 @@ def test_start_prompt_task_cleans_up_temp_images(monkeypatch, tmp_path):
     assert not temp_image.exists()
 
 
-def test_start_prompt_task_emits_progress_log_and_recovers_from_edit_failure(monkeypatch, tmp_path):
+def test_start_prompt_task_emits_append_only_progress_log_and_final_answer(monkeypatch, tmp_path):
     state_file = str(tmp_path / ".telecode.state.json")
     project_a = tmp_path / "alpha"
     project_a.mkdir()
@@ -382,17 +399,14 @@ def test_start_prompt_task_emits_progress_log_and_recovers_from_edit_failure(mon
     project = topicbot.ProjectConfig(name="alpha", path=str(project_a))
 
     sent = []
-    edited = []
     message_ids = iter(range(1, 50))
 
     def fake_send_message(*args, **kwargs):
-        sent.append(kwargs["text"])
+        payload = dict(kwargs)
+        if len(args) >= 3:
+            payload.setdefault("text", args[2])
+        sent.append(payload["text"])
         return next(message_ids)
-
-    def fake_edit_message_text(*args, **kwargs):
-        edited.append(kwargs["text"])
-        if len(edited) == 1:
-            raise RuntimeError("edit failed")
 
     def fake_run_prompt(*args, **kwargs):
         callback = kwargs["event_callback"]
@@ -419,7 +433,6 @@ def test_start_prompt_task_emits_progress_log_and_recovers_from_edit_failure(mon
 
     monkeypatch.setattr(topicbot, "_run_prompt", fake_run_prompt)
     monkeypatch.setattr(topicbot, "telegram_send_message", fake_send_message)
-    monkeypatch.setattr(topicbot, "telegram_edit_message_text", fake_edit_message_text)
 
     started = topicbot._start_prompt_task(
         telegram=_dummy_telegram(),
@@ -442,9 +455,19 @@ def test_start_prompt_task_emits_progress_log_and_recovers_from_edit_failure(mon
         if topicbot._get_active_task(700, 77) is None:
             break
         time.sleep(0.02)
+    time.sleep(0.05)
 
     assert any(text.startswith("Progress Log\n") for text in sent)
+    assert not any(text.startswith("Progress\n") for text in sent)
     assert sent[-1] == "final answer"
+    state = topicbot.load_state(state_file)
+    task_journal = state["scopes"]["700:77"]["task_journal"]
+    assert task_journal["active_task_id"] == ""
+    task = task_journal["tasks"][-1]
+    assert task["status"] == "done"
+    assert task["final_message_sent"] is True
+    assert "Completed." in task["log_lines"]
+    assert "Final answer follows below." in task["log_lines"]
 
 
 def test_extract_last_agent_message_prefers_last_turn():
