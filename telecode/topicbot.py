@@ -1256,14 +1256,18 @@ def _send_scope_message(
     text: str,
     reply_markup: dict[str, Any] | None = None,
 ) -> int:
-    return telegram_send_message(
-        telegram,
-        chat_id,
-        _truncate_message(text),
-        reply_to_message_id=reply_to_message_id,
-        reply_markup=reply_markup,
-        message_thread_id=thread_id,
-    )
+    chunks = _chunk_message(text)
+    last_message_id = 0
+    for index, chunk in enumerate(chunks):
+        last_message_id = telegram_send_message(
+            telegram,
+            chat_id,
+            chunk,
+            reply_to_message_id=reply_to_message_id if index == 0 else None,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            message_thread_id=thread_id,
+        )
+    return last_message_id
 
 
 def _message_thread_id(message: dict[str, Any]) -> int | None:
@@ -1431,13 +1435,30 @@ def _run_cli_command(
     output = "\n".join(part for part in [stdout, stderr] if part)
     if not output:
         output = "Command finished with no output."
-    return _truncate_message(output)
+    return output
 
 
-def _truncate_message(text: str, limit: int = 3500) -> str:
+def _chunk_message(text: str, limit: int = 3500) -> list[str]:
+    if not text:
+        return [""]
     if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n...[truncated]"
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at < max(0, int(limit * 0.6)):
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at < max(0, int(limit * 0.6)):
+            split_at = limit
+        else:
+            split_at += 1
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _truncate_inline(text: str, limit: int = 160) -> str:

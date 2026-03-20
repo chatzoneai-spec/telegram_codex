@@ -470,6 +470,43 @@ def test_start_prompt_task_emits_append_only_progress_log_and_final_answer(monke
     assert "Final answer follows below." in task["log_lines"]
 
 
+def test_send_scope_message_splits_long_text_without_truncation(monkeypatch):
+    sent = []
+    message_ids = iter(range(1, 20))
+
+    def fake_send(*args, **kwargs):
+        payload = dict(kwargs)
+        if len(args) >= 2:
+            payload.setdefault("chat_id", args[1])
+        if len(args) >= 3:
+            payload.setdefault("text", args[2])
+        sent.append(payload)
+        return next(message_ids)
+
+    monkeypatch.setattr(topicbot, "telegram_send_message", fake_send)
+
+    text = ("A" * 3400) + "\n" + ("B" * 3400) + "\n" + ("C" * 400)
+    last_message_id = topicbot._send_scope_message(
+        _dummy_telegram(),
+        123,
+        45,
+        99,
+        text,
+        reply_markup={"inline_keyboard": [[{"text": "x", "callback_data": "y"}]]},
+    )
+
+    assert len(sent) == 3
+    assert "".join(item["text"] for item in sent) == text
+    assert sent[0]["reply_to_message_id"] == 99
+    assert "reply_to_message_id" not in sent[1]
+    assert "reply_to_message_id" not in sent[2]
+    assert "reply_markup" not in sent[0]
+    assert "reply_markup" not in sent[1]
+    assert sent[2]["reply_markup"]["inline_keyboard"][0][0]["text"] == "x"
+    assert all(item["message_thread_id"] == 45 for item in sent)
+    assert last_message_id == 3
+
+
 def test_extract_last_agent_message_prefers_last_turn():
     output = "\n".join(
         [
